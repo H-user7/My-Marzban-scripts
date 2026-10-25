@@ -10,6 +10,11 @@ DATA_DIR="/var/lib/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 ENV_FILE="$APP_DIR/.env"
 LAST_XRAY_CORES=10
+SCRIPT_REPO="H-user7/My-Marzban-scripts"
+PANEL_REPO="H-user7/My-Marzban"
+PANEL_BRANCH="master"
+SOURCE_DIR="$APP_DIR/source"
+PANEL_VERSION_FILE="$APP_DIR/.panel-version"
 
 colorized_echo() {
     local color=$1
@@ -123,10 +128,16 @@ detect_compose() {
 }
 
 install_marzban_script() {
-    FETCH_REPO="Gozargah/Marzban-scripts"
-    SCRIPT_URL="https://github.com/$FETCH_REPO/raw/master/marzban.sh"
+    local script_url="https://raw.githubusercontent.com/$SCRIPT_REPO/master/marzban.sh"
+    local script_file
+    script_file=$(mktemp)
     colorized_echo blue "Installing marzban script"
-    curl -sSL $SCRIPT_URL | install -m 755 /dev/stdin /usr/local/bin/marzban
+    if ! curl -fsSL "$script_url" -o "$script_file"; then
+        rm -f "$script_file"
+        return 1
+    fi
+    install -m 755 "$script_file" /usr/local/bin/marzban
+    rm -f "$script_file"
     colorized_echo green "marzban script installed successfully"
 }
 
@@ -706,14 +717,64 @@ update_core_command() {
     colorized_echo blue "Installation of Xray-core version $selected_version completed."
 }
 
+download_marzban_source() {
+    local version=$1
+    if [[ ! "$version" =~ ^(latest|dev|v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        colorized_echo red "Invalid panel version: $version"
+        return 1
+    fi
+    local ref
+    case "$version" in
+        latest) ref="refs/heads/$PANEL_BRANCH" ;;
+        dev) ref="refs/heads/dev" ;;
+        *) ref="refs/tags/$version" ;;
+    esac
+
+    local staging_dir
+    staging_dir=$(mktemp -d "$APP_DIR/.panel-source.XXXXXX")
+    colorized_echo blue "Downloading $PANEL_REPO ($version)"
+    if ! curl -fSL --retry 3 "https://codeload.github.com/$PANEL_REPO/tar.gz/$ref" -o "$staging_dir/source.tar.gz"; then
+        colorized_echo red "Could not download $version from $PANEL_REPO. Check that the branch or tag exists."
+        rm -rf "$staging_dir"
+        return 1
+    fi
+    mkdir "$staging_dir/source"
+    if ! tar -xzf "$staging_dir/source.tar.gz" --strip-components=1 -C "$staging_dir/source"; then
+        rm -rf "$staging_dir"
+        return 1
+    fi
+    local file
+    for file in Dockerfile .env.example xray_config.json; do
+        if [ ! -f "$staging_dir/source/$file" ]; then
+            colorized_echo red "Panel source is missing $file"
+            rm -rf "$staging_dir"
+            return 1
+        fi
+    done
+
+    # Use this scripts fork for the Xray helper used by the panel's Dockerfile.
+    sed -i "s|https://github.com/Gozargah/Marzban-scripts/raw/master/install_latest_xray.sh|https://raw.githubusercontent.com/$SCRIPT_REPO/master/install_latest_xray.sh|g" "$staging_dir/source/Dockerfile"
+    rm -rf "$SOURCE_DIR"
+    mv "$staging_dir/source" "$SOURCE_DIR"
+    rm -rf "$staging_dir"
+}
+
+configure_marzban_build() {
+    # Keep existing environment, volumes, ports and database services on upgrades.
+    yq -i '.services.marzban.image = "my-marzban:local" | .services.marzban.build = {"context": "./source"} | del(.services.marzban.pull_policy)' "$COMPOSE_FILE"
+}
+
+build_marzban() {
+    colorized_echo blue "Building your Marzban panel from source"
+    $COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" build --pull marzban
+}
+
 install_marzban() {
     local marzban_version=$1
     local database_type=$2
-    # Fetch releases
-    FILES_URL_PREFIX="https://raw.githubusercontent.com/Gozargah/Marzban/master"
-    
     mkdir -p "$DATA_DIR"
     mkdir -p "$APP_DIR"
+    download_marzban_source "$marzban_version"
     
     colorized_echo blue "Setting up docker-compose.yml"
     docker_file_path="$APP_DIR/docker-compose.yml"
@@ -723,7 +784,8 @@ install_marzban() {
         cat > "$docker_file_path" <<EOF
 services:
   marzban:
-    image: gozargah/marzban:${marzban_version}
+    image: my-marzban:local
+    build: ./source
     restart: always
     env_file: .env
     network_mode: host
@@ -765,7 +827,6 @@ services:
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       start_period: 10s
-      start_interval: 3s
       interval: 10s
       timeout: 5s
       retries: 3
@@ -777,7 +838,7 @@ EOF
 
         # Modify .env file
         colorized_echo blue "Fetching .env file"
-        curl -sL "$FILES_URL_PREFIX/.env.example" -o "$APP_DIR/.env"
+        cp "$SOURCE_DIR/.env.example" "$ENV_FILE"
 
         # Comment out the SQLite line
         sed -i 's~^\(SQLALCHEMY_DATABASE_URL = "sqlite:////var/lib/marzban/db.sqlite3"\)~#\1~' "$APP_DIR/.env"
@@ -814,7 +875,8 @@ EOF
         cat > "$docker_file_path" <<EOF
 services:
   marzban:
-    image: gozargah/marzban:${marzban_version}
+    image: my-marzban:local
+    build: ./source
     restart: always
     env_file: .env
     network_mode: host
@@ -869,7 +931,7 @@ EOF
 
         # Modify .env file
         colorized_echo blue "Fetching .env file"
-        curl -sL "$FILES_URL_PREFIX/.env.example" -o "$APP_DIR/.env"
+        cp "$SOURCE_DIR/.env.example" "$ENV_FILE"
 
         # Comment out the SQLite line
         sed -i 's~^\(SQLALCHEMY_DATABASE_URL = "sqlite:////var/lib/marzban/db.sqlite3"\)~#\1~' "$APP_DIR/.env"
@@ -905,21 +967,23 @@ EOF
         echo "----------------------------"
         colorized_echo red "Using SQLite as database"
         echo "----------------------------"
-        colorized_echo blue "Fetching compose file"
-        curl -sL "$FILES_URL_PREFIX/docker-compose.yml" -o "$docker_file_path"
-
-        # Install requested version
-        if [ "$marzban_version" == "latest" ]; then
-            yq -i '.services.marzban.image = "gozargah/marzban:latest"' "$docker_file_path"
-        else
-            yq -i ".services.marzban.image = \"gozargah/marzban:${marzban_version}\"" "$docker_file_path"
-        fi
+        cat > "$docker_file_path" <<EOF
+services:
+  marzban:
+    image: my-marzban:local
+    build: ./source
+    restart: always
+    env_file: .env
+    network_mode: host
+    volumes:
+      - /var/lib/marzban:/var/lib/marzban
+EOF
         echo "Installing $marzban_version version"
         colorized_echo green "File saved in $APP_DIR/docker-compose.yml"
 
 
         colorized_echo blue "Fetching .env file"
-        curl -sL "$FILES_URL_PREFIX/.env.example" -o "$APP_DIR/.env"
+        cp "$SOURCE_DIR/.env.example" "$ENV_FILE"
 
         sed -i 's/^# \(XRAY_JSON = .*\)$/\1/' "$APP_DIR/.env"
         sed -i 's/^# \(SQLALCHEMY_DATABASE_URL = .*\)$/\1/' "$APP_DIR/.env"
@@ -935,10 +999,12 @@ EOF
     fi
     
     colorized_echo blue "Fetching xray config file"
-    curl -sL "$FILES_URL_PREFIX/xray_config.json" -o "$DATA_DIR/xray_config.json"
+    cp "$SOURCE_DIR/xray_config.json" "$DATA_DIR/xray_config.json"
     colorized_echo green "File saved in $DATA_DIR/xray_config.json"
     
-    colorized_echo green "Marzban's files downloaded successfully"
+    build_marzban
+    printf '%s\n' "$marzban_version" > "$PANEL_VERSION_FILE"
+    colorized_echo green "Your Marzban panel built successfully"
 }
 
 up_marzban() {
@@ -1054,6 +1120,14 @@ install_command() {
             exit 1
         fi
     fi
+    if [[ ! "$marzban_version" =~ ^(latest|dev|v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        colorized_echo red "Invalid version. Use latest, dev, or a tag such as v0.8.4 from $PANEL_REPO."
+        exit 1
+    fi
+    case "$database_type" in
+        sqlite|mysql|mariadb) ;;
+        *) colorized_echo red "Invalid database: $database_type"; exit 1 ;;
+    esac
     detect_os
     if ! command -v jq >/dev/null 2>&1; then
         install_package jq
@@ -1067,39 +1141,13 @@ install_command() {
     if ! command -v yq >/dev/null 2>&1; then
         install_yq
     fi
+    if ! command -v tar >/dev/null 2>&1; then
+        install_package tar
+    fi
     detect_compose
     install_marzban_script
-    # Function to check if a version exists in the GitHub releases
-    check_version_exists() {
-        local version=$1
-        repo_url="https://api.github.com/repos/Gozargah/Marzban/releases"
-        if [ "$version" == "latest" ] || [ "$version" == "dev" ]; then
-            return 0
-        fi
-        
-        # Fetch the release data from GitHub API
-        response=$(curl -s "$repo_url")
-        
-        # Check if the response contains the version tag
-        if echo "$response" | jq -e ".[] | select(.tag_name == \"${version}\")" > /dev/null; then
-            return 0
-        else
-            return 1
-        fi
-    }
-    # Check if the version is valid and exists
-    if [[ "$marzban_version" == "latest" || "$marzban_version" == "dev" || "$marzban_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if check_version_exists "$marzban_version"; then
-            install_marzban "$marzban_version" "$database_type"
-            echo "Installing $marzban_version version"
-        else
-            echo "Version $marzban_version does not exist. Please enter a valid version (e.g. v0.5.2)"
-            exit 1
-        fi
-    else
-        echo "Invalid version format. Please enter a valid version (e.g. v0.5.2)"
-        exit 1
-    fi
+    # The archive download validates that the ref exists in this fork.
+    install_marzban "$marzban_version" "$database_type"
     up_marzban
     follow_marzban_logs
 }
@@ -1461,7 +1509,7 @@ update_command() {
     detect_compose
     
     update_marzban_script
-    colorized_echo blue "Pulling latest version"
+    colorized_echo blue "Updating your panel from $PANEL_REPO"
     update_marzban
     
     colorized_echo blue "Restarting Marzban's services"
@@ -1472,15 +1520,43 @@ update_command() {
 }
 
 update_marzban_script() {
-    FETCH_REPO="Gozargah/Marzban-scripts"
-    SCRIPT_URL="https://github.com/$FETCH_REPO/raw/master/marzban.sh"
-    colorized_echo blue "Updating marzban script"
-    curl -sSL $SCRIPT_URL | install -m 755 /dev/stdin /usr/local/bin/marzban
-    colorized_echo green "marzban script updated successfully"
+    install_marzban_script
 }
 
 update_marzban() {
-    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" pull
+    if ! command -v yq >/dev/null 2>&1; then
+        install_yq
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        detect_os
+        install_package tar
+    fi
+
+    local version="latest"
+    if [ -f "$PANEL_VERSION_FILE" ]; then
+        version=$(cat "$PANEL_VERSION_FILE")
+    fi
+    download_marzban_source "$version"
+
+    local compose_backup
+    compose_backup=$(mktemp "$APP_DIR/.compose.XXXXXX")
+    cp "$COMPOSE_FILE" "$compose_backup"
+    if ! configure_marzban_build || ! build_marzban; then
+        cp "$compose_backup" "$COMPOSE_FILE"
+        rm -f "$compose_backup"
+        return 1
+    fi
+    rm -f "$compose_backup"
+
+    # Only companion services use registry images; the panel was built above.
+    local services service
+    services=$($COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" config --services)
+    while IFS= read -r service; do
+        if [ -n "$service" ] && [ "$service" != "marzban" ]; then
+            $COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" pull "$service"
+        fi
+    done <<< "$services"
+    printf '%s\n' "$version" > "$PANEL_VERSION_FILE"
 }
 
 check_editor() {
